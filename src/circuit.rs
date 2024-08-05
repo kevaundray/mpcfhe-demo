@@ -5,6 +5,7 @@ use phantom_zone::{
     SampleExtractor,
 };
 use rand::{thread_rng, RngCore};
+use rayon::prelude::*;
 
 use crate::types::{ConstFheUint8, EncryptedU8Values};
 use crate::{Cipher, FheUint8, ServerKeyShare};
@@ -21,37 +22,34 @@ pub(crate) fn init_state(tile: &Board) -> Board {
     tile.clone()
 }
 
-fn not(x: &FheBool) -> FheBool {
-    !x
-}
-
-pub(crate) fn select2(
+pub(crate) fn select(
     tile: &Board,
     encrypted_zero: &FheUint8,
     coord: &(FheUint8, FheUint8),
     board_coords: &[(FheUint8, FheUint8); BOARD_SIZE],
-    max_coord: &FheUint8, // Maximum allowed coordinate value (e.g., 19 for a 20x20 board)
+    max_coord: &FheUint8,
 ) -> FheUint8 {
     let (x, y) = coord;
-    let mut result = encrypted_zero.clone();
 
     // Check if x and y are within bounds
-    let x_in_bounds = x.le(&max_coord);
-    let y_in_bounds = y.le(&max_coord);
+    let x_in_bounds = x.le(max_coord);
+    let y_in_bounds = y.le(max_coord);
     let in_bounds = &x_in_bounds & &y_in_bounds;
 
-    for i in 0..BOARD_SIZE {
-        let (x_value, y_value) = &board_coords[i];
-        let x_match = x.eq(x_value);
-        let y_match = y.eq(y_value);
-        let coord_match = &x_match & &y_match;
+    // Use Rayon's parallel iterator
+    let result: FheUint8 = (0..BOARD_SIZE)
+        .into_par_iter()
+        .map(|i| {
+            let (x_value, y_value) = &board_coords[i];
+            let x_match = x.eq(x_value);
+            let y_match = y.eq(y_value);
+            let coord_match = &x_match & &y_match;
+            // Only select if coordinates are in bounds
+            let safe_coord_match = &coord_match & &in_bounds;
+            tile.eggs[i].mux(encrypted_zero, &safe_coord_match)
+        })
+        .reduce(|| encrypted_zero.clone(), |a, b| &a + &b);
 
-        // Only select if coordinates are in bounds
-        let safe_coord_match = &coord_match & &in_bounds;
-
-        let masked_value = tile.eggs[i].mux(&encrypted_zero, &safe_coord_match);
-        result = &result + &masked_value;
-    }
     result
 }
 
@@ -60,7 +58,7 @@ pub(crate) fn select2(
 // we choose 20 to make the board small and also because
 // we currently only have FheUINT8, so each coordinate
 // must fit within a u8
-const BOARD_DIMS: u8 = 20;
+const BOARD_DIMS: u8 = 2;
 const BOARD_SIZE: usize = (BOARD_DIMS as usize) * (BOARD_DIMS as usize);
 
 pub struct Server {
@@ -127,7 +125,7 @@ impl Server {
         }
     }
     pub(crate) fn set_fhe_square(&self, coord: &(FheUint8, FheUint8)) {
-        select2(
+        select(
             &self.board,
             &self.encrypted_zero,
             coord,
@@ -187,7 +185,17 @@ fn test_uint8_square_demo() {
         (tmp.swap_remove(0), tmp.swap_remove(0))
     };
 
-    server.set_fhe_square(&encrypted_coord);
+    rayon::ThreadPoolBuilder::new()
+        .build_scoped(
+            // Initialize thread-local storage parameters
+            |thread| {
+                set_parameter_set(ParameterSelector::NonInteractiveLTE2Party);
+                thread.run()
+            },
+            // Run parallel code under this pool
+            |pool| pool.install(|| server.set_fhe_square(&encrypted_coord)),
+        )
+        .unwrap()
 
     // // Server does key switch on client ciphertext to make it possible
     // // to do fhe operations on them
