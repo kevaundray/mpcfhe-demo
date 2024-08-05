@@ -6,24 +6,12 @@ use phantom_zone::{
 };
 use rand::{thread_rng, RngCore};
 
+use crate::types::{ConstFheUint8, EncryptedU8Values};
 use crate::{Cipher, FheUint8, ServerKeyShare};
-
-/// Circuit
-pub(crate) fn sum_fhe_dyn(receving_karmas: &[FheUint8], given_out: &FheUint8) -> FheUint8 {
-    let sum: FheUint8 = receving_karmas
-        .iter()
-        .cloned()
-        .reduce(|a, b| &a + &b)
-        .expect("At least one input is received");
-    &sum - given_out
-}
-
-const BOARD_SIZE: usize = 4;
 
 #[derive(Clone)]
 struct Board {
-    eggs: [FheBool; BOARD_SIZE],
-    // user_positions : Vec<(FheBool, FheBool)>
+    eggs: [FheUint8; BOARD_SIZE],
 }
 
 // This is tech debt.
@@ -37,84 +25,120 @@ fn not(x: &FheBool) -> FheBool {
     !x
 }
 
-pub(crate) fn select(tile: &Board, coord: &(FheBool, FheBool)) -> FheBool {
-    let x = &coord.0;
-    let y = &coord.1;
+pub(crate) fn select2(
+    tile: &Board,
+    encrypted_zero: &FheUint8,
+    coord: &(FheUint8, FheUint8),
+    board_coords: &[(FheUint8, FheUint8); BOARD_SIZE],
+    max_coord: &FheUint8, // Maximum allowed coordinate value (e.g., 19 for a 20x20 board)
+) -> FheUint8 {
+    let (x, y) = coord;
+    let mut result = encrypted_zero.clone();
 
-    // (0,0)
-    let cond_1 = &(&not(x) & &not(y)) & &tile.eggs[0];
-    // (0,1)
-    let cond_2 = &(&not(x) & &y) & &tile.eggs[1];
-    // (1,0)
-    let cond_3 = &(x & &not(y)) & &tile.eggs[2];
-    // (1,1)
-    let cond_4 = &(x & &y) & &tile.eggs[3];
-    &(&(&cond_1 | &cond_2) | &cond_3) | &cond_4
+    // Check if x and y are within bounds
+    let x_in_bounds = x.le(&max_coord);
+    let y_in_bounds = y.le(&max_coord);
+    let in_bounds = &x_in_bounds & &y_in_bounds;
+
+    for i in 0..BOARD_SIZE {
+        let (x_value, y_value) = &board_coords[i];
+        let x_match = x.eq(x_value);
+        let y_match = y.eq(y_value);
+        let coord_match = &x_match & &y_match;
+
+        // Only select if coordinates are in bounds
+        let safe_coord_match = &coord_match & &in_bounds;
+
+        let masked_value = tile.eggs[i].mux(&encrypted_zero, &safe_coord_match);
+        result = &result + &masked_value;
+    }
+    result
 }
 
-// pub(crate) fn select2(
-//     tile: &Board,
-//     encrypted_zero: FheUint8,
-//     encrypted_one: FheUint8,
-//     coord: &(FheUint8, FheUint8),
-//     board_coords: &[(FheUint8, FheUint8); 400],
-// ) -> FheUint8 {
-//     let (x, y) = coord;
+// This is the length and width of the board
+// It will always be a square.
+// we choose 20 to make the board small and also because
+// we currently only have FheUINT8, so each coordinate
+// must fit within a u8
+const BOARD_DIMS: u8 = 20;
+const BOARD_SIZE: usize = (BOARD_DIMS as usize) * (BOARD_DIMS as usize);
 
-//     let mut result = encrypted_zero;
+pub struct Server {
+    max_coord: ConstFheUint8,
+    encrypted_zero: ConstFheUint8,
 
-//     for i in 0..400 {
-//         let (x_value, y_value) = &board_coords[i];
-//         let x_match = x.eq(x_value);
-//         let y_match = y.eq(y_value);
-//         let coord_match = &x_match & &y_match;
-
-//         let masked_value = coord_match.if_then_else(&tile.eggs[i], &encrypted_zero);
-
-//         result = result + masked_value;
-//     }
-
-//     result
-// }
-
-pub(crate) fn set_fhe_square(tile: &mut Board, coord: &(FheBool, FheBool)) {
-    // Select the board value corresponding to the coordinate
-    let selected_value = select(tile, coord);
-    // Flip the value
-    let flipped_value = not(&selected_value);
-
-    // Now replace the value on the board
-
-    // (0,0)
-    let tile_was_0_0 = is_equal(coord, (false, false));
-    tile.eggs[0] = &(&tile_was_0_0 & &flipped_value) | &(&not(&tile_was_0_0) & &tile.eggs[0]);
-
-    // (0,1)
-    let tile_was_0_1 = is_equal(coord, (false, true));
-    tile.eggs[1] = &(&tile_was_0_1 & &flipped_value) | &(&not(&tile_was_0_1) & &tile.eggs[1]);
-
-    // (1,0)
-    let tile_was_1_0 = is_equal(coord, (true, false));
-    tile.eggs[2] = &(&tile_was_1_0 & &flipped_value) | &(&not(&tile_was_1_0) & &tile.eggs[2]);
-
-    // (1,1)
-    let tile_was_1_1 = is_equal(coord, (true, true));
-    tile.eggs[3] = &(&tile_was_1_1 & &flipped_value) | &(&not(&tile_was_1_1) & &tile.eggs[3]);
+    board: Board,
+    board_coords: [(ConstFheUint8, ConstFheUint8); BOARD_SIZE],
 }
 
-fn is_equal(coord: &(FheBool, FheBool), coord2: (bool, bool)) -> FheBool {
-    let x = &coord.0;
-    let y = &coord.1;
-    match coord2 {
-        (true, true) => (x & &y),
-        (true, false) => (x & &not(y)),
-        (false, true) => (&not(x) & &y),
-        (false, false) => (&not(x) & &not(y)),
+// Since we do not have access to ciphertext constants (right now)
+// We need one of the clients to encrypt the constants for us
+// to setup the board and to store encrypted constants that the
+// server will need.
+pub fn setup_values(client_key: ClientKey) -> EncryptedU8Values {
+    let board_dim_range: Vec<u8> = (0..BOARD_DIMS).collect();
+    client_key.encrypt(board_dim_range.as_slice())
+}
+
+impl Server {
+    fn new(
+        encrypted_coord_range: EncryptedU8Values,
+        party_who_encrypted_constants: usize,
+    ) -> Server {
+        let encrypted_constants = encrypted_coord_range
+            .unseed::<Vec<Vec<u64>>>()
+            .key_switch(party_who_encrypted_constants)
+            .extract_all();
+
+        // We should have BOARD_DIMS number of encrypted constants
+        let encrypted_constants: [FheUint8; BOARD_DIMS as usize] =
+            encrypted_constants.try_into().unwrap();
+
+        let encrypted_zero = encrypted_constants[0].clone();
+        let eggs = vec![encrypted_zero.clone(); BOARD_SIZE];
+
+        // Make the board be all zeroes as initial state
+        let board = Board {
+            eggs: eggs.try_into().unwrap(),
+        };
+
+        let max_coord = encrypted_constants.last().unwrap().clone();
+
+        fn generate_coordinates(values: &[FheUint8]) -> Vec<(FheUint8, FheUint8)> {
+            let mut coordinates = Vec::with_capacity(values.len() * values.len());
+
+            for x in values {
+                for y in values {
+                    coordinates.push((x.clone(), y.clone()));
+                }
+            }
+
+            coordinates
+        }
+        let board_coords = generate_coordinates(&encrypted_constants)
+            .try_into()
+            .unwrap();
+
+        Server {
+            max_coord,
+            board,
+            encrypted_zero,
+            board_coords,
+        }
+    }
+    pub(crate) fn set_fhe_square(&self, coord: &(FheUint8, FheUint8)) {
+        select2(
+            &self.board,
+            &self.encrypted_zero,
+            coord,
+            &self.board_coords,
+            &self.max_coord,
+        );
     }
 }
 
 #[test]
-fn test_boolean_square_demo() {
+fn test_uint8_square_demo() {
     // The number of people in the MPC computation
     //
     // This should be parametrizable by the number of parties
@@ -145,54 +169,72 @@ fn test_boolean_square_demo() {
     server_key.set_server_key();
 
     // Set the initial state
-    let c0 = cks[0].encrypt(vec![false; BOARD_SIZE].as_slice());
+    // These are values from 0 to BOARD_DIMS - 1
+    const PARTY_WHO_ENCRYPTED_CONSTANTS: usize = 0;
+    let encrypted_constants = setup_values(cks[PARTY_WHO_ENCRYPTED_CONSTANTS].clone());
+    // Setup server with initial state
+    let server = Server::new(encrypted_constants, PARTY_WHO_ENCRYPTED_CONSTANTS);
 
-    // Server does key switch on client ciphertext to make it possible
-    // to do fhe operations on them
-    //
-    // Server needs to know which user has given them what cipher text
-    let board_state = c0.unseed::<Vec<Vec<u64>>>().key_switch(0).extract_all();
-    let eggs: [FheBool; BOARD_SIZE] = match board_state.try_into() {
-        Ok(x) => x,
-        Err(_) => panic!("board state size incorrect"),
-    };
-    let mut board = Board { eggs };
+    // Now lets set a value in the first quadrant
+    let client_encrypted_coord = cks[1].encrypt(vec![0u8, 0u8].as_slice());
 
-    // Client 1 encrypts (0,0) and sends that to the server to change
-    let c1 = cks[1].encrypt(vec![false, false].as_slice());
-    let coord = {
-        let mut tmp = c1.unseed::<Vec<Vec<u64>>>().key_switch(1).extract_all();
+    // Server now needs to key switch
+    let encrypted_coord = {
+        let mut tmp = client_encrypted_coord
+            .unseed::<Vec<Vec<u64>>>()
+            .key_switch(1)
+            .extract_all();
         (tmp.swap_remove(0), tmp.swap_remove(0))
     };
 
-    // Server to change a value on the board
-    set_fhe_square(&mut board, &coord);
+    server.set_fhe_square(&encrypted_coord);
 
-    let c1 = cks[1].encrypt(vec![false, true].as_slice());
-    let coord = {
-        let mut tmp = c1.unseed::<Vec<Vec<u64>>>().key_switch(1).extract_all();
-        (tmp.swap_remove(0), tmp.swap_remove(0))
-    };
+    // // Server does key switch on client ciphertext to make it possible
+    // // to do fhe operations on them
+    // //
+    // // Server needs to know which user has given them what cipher text
+    // let board_state = c0.unseed::<Vec<Vec<u64>>>().key_switch(0).extract_all();
+    // let eggs: [FheBool; BOARD_SIZE] = match board_state.try_into() {
+    //     Ok(x) => x,
+    //     Err(_) => panic!("board state size incorrect"),
+    // };
+    // let mut board = Board { eggs };
 
-    // Server to change a value on the board
-    set_fhe_square(&mut board, &coord);
+    // // Client 1 encrypts (0,0) and sends that to the server to change
+    // let c1 = cks[1].encrypt(vec![false, false].as_slice());
+    // let coord = {
+    //     let mut tmp = c1.unseed::<Vec<Vec<u64>>>().key_switch(1).extract_all();
+    //     (tmp.swap_remove(0), tmp.swap_remove(0))
+    // };
 
-    // Each client generates a decryption share for the output received
-    // from the server
-    let mut vec_dec_shares = Vec::new();
-    for state_element in board.eggs.clone() {
-        let dec_shares = cks
-            .iter()
-            .map(|k| k.gen_decryption_share(&state_element))
-            .collect_vec();
+    // // Server to change a value on the board
+    // set_fhe_square(&mut board, &coord);
 
-        vec_dec_shares.push(dec_shares);
-    }
+    // let c1 = cks[1].encrypt(vec![false, true].as_slice());
+    // let coord = {
+    //     let mut tmp = c1.unseed::<Vec<Vec<u64>>>().key_switch(1).extract_all();
+    //     (tmp.swap_remove(0), tmp.swap_remove(0))
+    // };
 
-    let mut unencrypted_board = Vec::new();
-    for (dec_shares, enc_out) in vec_dec_shares.iter().zip(board.eggs.iter()) {
-        unencrypted_board.push(cks[0].aggregate_decryption_shares(enc_out, dec_shares));
-    }
+    // // Server to change a value on the board
+    // set_fhe_square(&mut board, &coord);
 
-    dbg!(unencrypted_board);
+    // // Each client generates a decryption share for the output received
+    // // from the server
+    // let mut vec_dec_shares = Vec::new();
+    // for state_element in board.eggs.clone() {
+    //     let dec_shares = cks
+    //         .iter()
+    //         .map(|k| k.gen_decryption_share(&state_element))
+    //         .collect_vec();
+
+    //     vec_dec_shares.push(dec_shares);
+    // }
+
+    // let mut unencrypted_board = Vec::new();
+    // for (dec_shares, enc_out) in vec_dec_shares.iter().zip(board.eggs.iter()) {
+    //     unencrypted_board.push(cks[0].aggregate_decryption_shares(enc_out, dec_shares));
+    // }
+
+    // dbg!(unencrypted_board);
 }
