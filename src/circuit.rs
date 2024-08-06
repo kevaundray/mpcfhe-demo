@@ -1,3 +1,6 @@
+use crate::join;
+use crate::types::{ConstFheUint8, EncryptedU8Values};
+use crate::{Cipher, FheUint8, ServerKeyShare};
 use itertools::Itertools;
 use phantom_zone::*;
 use phantom_zone::{
@@ -6,9 +9,6 @@ use phantom_zone::{
 };
 use rand::{thread_rng, RngCore};
 use rayon::prelude::*;
-
-use crate::types::{ConstFheUint8, EncryptedU8Values};
-use crate::{Cipher, FheUint8, ServerKeyShare};
 
 #[derive(Clone)]
 struct Board {
@@ -196,7 +196,6 @@ impl Server {
         token: &FheUint8,
         direction: &FheUint8,
     ) -> ((FheUint8, FheUint8), FheBool) {
-        // We return a 1 to indicate an error
         if player_id >= self.player_tokens.len() {
             return (
                 (self.encrypted_zero.clone(), self.encrypted_zero.clone()),
@@ -204,50 +203,41 @@ impl Server {
             );
         }
 
-        // Get the current player's coordinate which is x and y
         let (current_x, current_y) = self.player_coords[player_id].clone().unwrap();
-        // Get the player's auth token
         let player_token = self.player_tokens[player_id].clone().unwrap();
 
-        // Create encrypted constants
         let zero = &self.encrypted_zero;
         let one = &self.encrypted_one;
         let two = &self.encrypted_two;
         let three = &self.encrypted_three;
         let board_size = &self.max_coord + &self.encrypted_one;
 
-        // Calculate new coordinates based on direction
-        let up = direction.eq(zero);
-        let down = direction.eq(one);
-        let left = direction.eq(two);
-        let right = direction.eq(three);
+        // Parallel computation of all independent operations
+        let (up, down, left, right, x_minus_one, x_plus_one, y_minus_one, y_plus_one, token_match) = join!(
+            || direction.eq(zero),
+            || direction.eq(one),
+            || direction.eq(two),
+            || direction.eq(three),
+            || &current_x - one,
+            || &current_x + one,
+            || &current_y - one,
+            || &current_y + one,
+            || token.eq(&player_token)
+        );
 
-        // Calculate new x coordinate with wrapping
-        //
-        // TODO: Optimize modulo operation by replacing it with a mux, plus an addition.
-        // TODO: Since we know that the value will only be one multiple of board_size away from the
-        // TODO: canonical range
-        let x_minus_one = &(&current_x - one);
-        let x_plus_one = &(&current_x + one);
-        let new_x = &current_x.mux(&x_minus_one, &left).mux(&x_plus_one, &right);
-        let new_x_reduced = new_x % &board_size;
+        // Parallel computation of new coordinates and reductions
+        let (new_x_reduced, new_y_reduced) = join!(
+            || (&current_x.mux(&x_minus_one, &left).mux(&x_plus_one, &right)) % &board_size,
+            || (&current_y.mux(&y_minus_one, &up).mux(&y_plus_one, &down)) % &board_size
+        );
 
-        // Calculate new y coordinate with wrapping
-        let y_minus_one = &(&current_y - one);
-        let y_plus_one = &(&current_y + one);
-        let new_y = &current_y.mux(&y_minus_one, &up).mux(&y_plus_one, &down);
-        let new_y_reduced = new_y % &board_size;
-
-        // Check if the provided token matches the player's token
-        let token_match = token.eq(&player_token);
-
-        // Update the player's coordinates only if the token matches
-        let final_x = current_x.mux(&new_x_reduced, &token_match);
-        let final_y = current_y.mux(&new_y_reduced, &token_match);
+        // Parallel computation of final coordinates
+        let (final_x, final_y) =
+            join!(|| current_x.mux(&new_x_reduced, &token_match), || current_y
+                .mux(&new_y_reduced, &token_match));
 
         self.player_coords[player_id] = Some((final_x.clone(), final_y.clone()));
 
-        // Return the new coordinates and true if the token matched, or the old coordinates and false if it didn't
         ((final_x, final_y), token_match)
     }
 }
